@@ -1,0 +1,119 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+
+          # Enable NLA (secure)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 1 -Force
+
+          # Enable TLS Security
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 2 -Force
+
+          # Remove old firewall rule
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+
+          # Allow only Tailscale network
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
+
+          # Restart RDP service
+          Restart-Service -Name TermService -Force
+
+      - name: Create or Update RDP User
+        run: |
+          $password = "Pias@1001"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          # Mask password in logs
+          Write-Host "::add-mask::$password"
+
+          # Create or update user
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+              Write-Host "User exists. Updating password..."
+              Set-LocalUser -Name "RDP" -Password $securePass
+          } else {
+              Write-Host "Creating user..."
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          }
+
+          # Ensure admin and RDP permissions
+          try { Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction Stop } catch {}
+          try { Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction Stop } catch {}
+
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $path = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $url -OutFile $path
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$path`"", "/quiet", "/norestart" -Wait
+          Remove-Item $path -Force
+
+      - name: Connect Tailscale
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=gh-rdp-$env:GITHUB_RUN_ID
+
+          # Wait for IP
+          $ip = $null
+          $tries = 0
+
+          while (-not $ip -and $tries -lt 20) {
+              $ip = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 | Select-Object -First 1).Trim()
+              Start-Sleep -Seconds 3
+              $tries++
+          }
+
+          if (-not $ip) {
+              Write-Error "No Tailscale IP"
+              exit 1
+          }
+
+          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+      - name: Verify Connection
+        run: |
+          Write-Host "Checking RDP..."
+
+          $result = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+
+          if (-not $result.TcpTestSucceeded) {
+              Write-Error "RDP failed"
+              exit 1
+          }
+
+          Write-Host "RDP Ready!"
+
+      - name: Show RDP Info
+        run: |
+          Write-Host ""
+          Write-Host "================================="
+          Write-Host "RDP READY"
+          Write-Host "Address  : $env:TAILSCALE_IP"
+          Write-Host "User     : RDP"
+          Write-Host "Password : $env:RDP_PASSWORD"
+          Write-Host "================================="
+          Write-Host ""
+
+          # Keep alive
+          while ($true) {
+              Write-Host "RDP Active..."
+              Start-Sleep -Seconds 300
+          }
